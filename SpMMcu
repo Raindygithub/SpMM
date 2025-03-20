@@ -1,0 +1,245 @@
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <mma.h>
+#include <cub/cub.cuh>
+#include <vector>
+#include <algorithm>
+#include <iostream>
+#include <tuple>  // 添加缺失的头文件
+
+#define cudaCheck(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line) {
+    if (code != cudaSuccess) {
+        fprintf(stderr, "GPU Error: %s %s %d\n", 
+                cudaGetErrorString(code), file, line);
+        exit(code);
+    }
+}
+
+const int BLOCK_SIZE = 16;
+const int WARP_SIZE = 32;
+
+struct BlockELLMatrix {
+    int rows, cols;
+    int block_size;
+    int num_blocks;
+    half* values;      // FP16存储
+    int* col_indices;
+    int* row_ptrs;
+    int* workload_map; // 负载均衡映射表
+};
+
+// 并行统计非零块数量的核函数
+__global__ void countNonZeroBlocksKernel(const float* dense_mat, int rows, int cols, int* block_nnz) {
+    int row_blk = blockIdx.x;
+    int col_blk = blockIdx.y;
+    int nnz = 0;
+    
+    for (int bi = 0; bi < BLOCK_SIZE; ++bi) {
+        for (int bj = 0; bj < BLOCK_SIZE; ++bj) {
+            int global_row = row_blk * BLOCK_SIZE + bi;
+            int global_col = col_blk * BLOCK_SIZE + bj;
+            if (global_row < rows && global_col < cols && dense_mat[global_row * cols + global_col] != 0) {
+                nnz++;
+            }
+        }
+    }
+    int idx = row_blk * gridDim.y + col_blk;
+    if (nnz > 0) block_nnz[idx] = nnz;
+    else block_nnz[idx] = 0;
+}
+
+// 带负载均衡的初始化（并行优化）
+void initBlockELLWithBalance(BlockELLMatrix &ell, const float* dense_mat, int rows, int cols) {
+    const int block_size = BLOCK_SIZE;
+    int num_row_blks = (rows + block_size - 1) / block_size;
+    int num_col_blks = (cols + block_size - 1) / block_size;
+    
+    // 1. 使用GPU并行统计非零块
+    int* d_block_nnz;
+    cudaCheck(cudaMalloc(&d_block_nnz, num_row_blks * num_col_blks * sizeof(int)));
+    dim3 grid(num_row_blks, num_col_blks);
+    countNonZeroBlocksKernel<<<grid, 1>>>(dense_mat, rows, cols, d_block_nnz);
+    cudaCheck(cudaDeviceSynchronize());
+
+    // 2. 收集非零块信息到Host
+    std::vector<int> h_block_nnz(num_row_blks * num_col_blks, 0);
+    cudaCheck(cudaMemcpy(h_block_nnz.data(), d_block_nnz, num_row_blks * num_col_blks * sizeof(int), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaFree(d_block_nnz));
+
+    std::vector<std::tuple<int, int, int>> blocks; // (row_blk, col_blk, nnz)
+    for (int i = 0; i < num_row_blks; ++i) {
+        for (int j = 0; j < num_col_blks; ++j) {
+            int nnz = h_block_nnz[i * num_col_blks + j];
+            if (nnz > 0) {
+                blocks.emplace_back(i, j, nnz);
+            }
+        }
+    }
+
+    // 3. 按非零元数量排序
+    std::sort(blocks.begin(), blocks.end(), 
+        [](const auto& a, const auto& b) { 
+            return std::get<2>(a) > std::get<2>(b); 
+        });
+
+    // 4. 构建ELL格式和row_ptrs
+    std::vector<half> values;
+    std::vector<int> col_indices, workload_map, row_ptrs(num_row_blks + 1, 0);
+    
+    for (const auto& blk : blocks) {
+        int row_blk = std::get<0>(blk);
+        int col_blk = std::get<1>(blk);
+        row_ptrs[row_blk + 1]++;  // 统计每行的块数
+    }
+    
+    // 前缀和生成row_ptrs
+    for (int i = 1; i <= num_row_blks; ++i) {
+        row_ptrs[i] += row_ptrs[i - 1];
+    }
+
+    // 填充values和col_indices
+    for (const auto& blk : blocks) {
+        int row_blk = std::get<0>(blk);
+        int col_blk = std::get<1>(blk);
+        
+        // 将块数据转换为FP16
+        for (int bi = 0; bi < block_size; ++bi) {
+            for (int bj = 0; bj < block_size; ++bj) {
+                int global_row = row_blk * block_size + bi;
+                int global_col = col_blk * block_size + bj;
+                float val = (global_row < rows && global_col < cols) ? dense_mat[global_row * cols + global_col] : 0.0f;
+                values.push_back(__float2half(val));
+            }
+        }
+        col_indices.push_back(col_blk);
+        workload_map.push_back(row_blk);
+    }
+
+    // 5. GPU内存分配
+    ell.rows = rows;
+    ell.cols = cols;
+    ell.block_size = block_size;
+    ell.num_blocks = blocks.size();
+    
+    cudaCheck(cudaMalloc(&ell.values, values.size() * sizeof(half)));
+    cudaCheck(cudaMemcpy(ell.values, values.data(), values.size() * sizeof(half), cudaMemcpyHostToDevice));
+    
+    cudaCheck(cudaMalloc(&ell.col_indices, col_indices.size() * sizeof(int)));
+    cudaCheck(cudaMemcpy(ell.col_indices, col_indices.data(), col_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
+    
+    cudaCheck(cudaMalloc(&ell.workload_map, workload_map.size() * sizeof(int)));
+    cudaCheck(cudaMemcpy(ell.workload_map, workload_map.data(), workload_map.size() * sizeof(int), cudaMemcpyHostToDevice));
+    
+    cudaCheck(cudaMalloc(&ell.row_ptrs, (num_row_blks + 1) * sizeof(int)));
+    cudaCheck(cudaMemcpy(ell.row_ptrs, row_ptrs.data(), (num_row_blks + 1) * sizeof(int), cudaMemcpyHostToDevice));
+}
+
+__global__ void adaptiveSpMMKernel(BlockELLMatrix ell, const half* B, float* C, int N) {
+    extern __shared__ int sched_table[]; // 动态共享内存
+    
+    // 加载负载均衡表
+    if (threadIdx.x < 128) {
+        sched_table[threadIdx.x] = ell.workload_map[blockIdx.x * 128 + threadIdx.x];
+    }
+    __syncthreads();
+
+    using namespace nvcuda;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, wmma::precision::tf32> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, wmma::precision::tf32> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+    
+    for (int idx = threadIdx.x; idx < 128; idx += blockDim.x) {
+        int row_blk = sched_table[idx];
+        if (row_blk == -1) continue;
+        
+        wmma::fill_fragment(c_frag, 0.0f);
+        int blk_start = ell.row_ptrs[row_blk];
+        int blk_end = ell.row_ptrs[row_blk + 1];
+        
+        for (int blk = blk_start; blk < blk_end; ++blk) {
+            int col_blk = ell.col_indices[blk];
+            
+            // 加载A矩阵块（FP16转TF32）
+            half* a_ptr = ell.values + blk * BLOCK_SIZE * BLOCK_SIZE;
+            float a_buffer[BLOCK_SIZE * BLOCK_SIZE];
+            for (int i = 0; i < BLOCK_SIZE * BLOCK_SIZE; ++i) {
+                a_buffer[i] = __half2float(a_ptr[i]);
+            }
+            wmma::load_matrix_sync(a_frag, a_buffer, BLOCK_SIZE);
+            
+            // 加载B矩阵块（FP16转TF32）
+            const half* b_ptr = B + col_blk * BLOCK_SIZE * N;
+            float b_buffer[BLOCK_SIZE * N];
+            for (int i = 0; i < BLOCK_SIZE * N; ++i) {
+                b_buffer[i] = __half2float(b_ptr[i]);
+            }
+            wmma::load_matrix_sync(b_frag, b_buffer, N);
+            
+            // Tensor Core计算
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        
+        // 存储结果
+        float* c_ptr = C + row_blk * BLOCK_SIZE * N;
+        wmma::store_matrix_sync(c_ptr, c_frag, N, wmma::mem_row_major);
+    }
+}
+
+void optimizedSpMM(BlockELLMatrix &ell, const half* B, float* C, int N) {
+    int num_warps = 4;
+    dim3 block(WARP_SIZE * num_warps);
+    dim3 grid((ell.num_blocks + 127) / 128);
+    
+    size_t shared_mem_size = 128 * sizeof(int);
+        // 执行核函数
+    cudaEvent_t start, stop;
+    cudaCheck(cudaEventCreate(&start));
+    cudaCheck(cudaEventCreate(&stop));
+
+    cudaCheck(cudaEventRecord(start));
+    adaptiveSpMMKernel<<<grid, block, shared_mem_size>>>(ell, B, C, N);
+    cudaCheck(cudaEventRecord(stop));
+    
+    
+    cudaCheck(cudaEventSynchronize(stop));
+    float ms;
+    cudaCheck(cudaEventElapsedTime(&ms, start, stop));
+    printf("Execution time: %.2fms, GFLOPS: %.2f\n", 
+          ms, 
+          (2.0f * ell.num_blocks * BLOCK_SIZE*BLOCK_SIZE*N) / (ms * 1e6));
+}
+
+int main() {
+    const int M = 4096, N = 4096, K = 4096;
+    
+    // 生成测试矩阵（示例：对角线矩阵）
+    std::vector<float> matrix(M * K, 0.0f);
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < K; ++j) {
+            if (i / BLOCK_SIZE == j / BLOCK_SIZE) matrix[i * K + j] = 1.0f;
+        }
+    }
+    
+    // 初始化BLOCK-ELL格式
+    BlockELLMatrix ell;
+    initBlockELLWithBalance(ell, matrix.data(), M, K);
+    
+    // 分配B和C矩阵内存
+    half *d_B;
+    float *d_C;
+    cudaCheck(cudaMalloc(&d_B, K * N * sizeof(half)));
+    cudaCheck(cudaMalloc(&d_C, M * N * sizeof(float)));
+    
+    // 执行优化后的SpMM
+    optimizedSpMM(ell, d_B, d_C, N);
+    
+    // 释放资源
+    cudaCheck(cudaFree(ell.values));
+    cudaCheck(cudaFree(ell.col_indices));
+    cudaCheck(cudaFree(ell.row_ptrs));
+    cudaCheck(cudaFree(ell.workload_map));
+    cudaCheck(cudaFree(d_B));
+    cudaCheck(cudaFree(d_C));
+    return 0;
+}
